@@ -54,6 +54,18 @@ clip = true          # patient-specific info (age/sex as JSON) -- the paper's bi
 input_stats = false
 examples = false     # required: build_prompt() reads cfg.examples directly
 
+# --- BiomedCoOp-style class prompting (decoder-only classification) ---
+# Injects an ensemble of LLM-generated, per-class descriptive prompts into the
+# decoder context (ported prompting strategy from HealthX-Lab/BiomedCoOp).
+class_prompts = true
+# "" / "none" / "default" -> use built-in ECG templates in models/biomedcoop_ts.py.
+# Or point to a JSON file (code -> list[str]), e.g.:
+#   class_prompts_path = "models/biomedcoop_prompts/ptbxl_ecg.json"
+class_prompts_path = ""
+class_prompts_per_class = 3      # how many descriptions per class to inject
+class_prompts_sample = true      # randomly sample K each step in training; first-K at eval
+class_codes = ["NORM", "MI", "STTC", "CD", "HYP"]   # PTB-XL superclass order
+
 [models.medtsllm.llm]
 enabled = true
 # decoder-only backbone (paper variant: MedTsLLM decoder-only on PTB-XL)
