@@ -1,53 +1,70 @@
 """
-BiomedCoOp-style class prompting for MedTsLLM (decoder-only classification).
+BiomedCoOp prompting strategy for MedTsLLM (decoder-only classification).
 
-This module ports *only the prompting strategy* of BiomedCoOp
-(https://github.com/HealthX-Lab/BiomedCoOp) into the decoder-only MedTsLLM
-classification path. It does **not** port the CLIP dual-encoder, the learnable
-context vectors, the statistics-based prompt selection (SPS), or the
-distillation losses (SCCM / KDSP), because those require an image-text
-contrastive model that MedTsLLM does not have.
+This is a *faithful* port of the BiomedCoOp mechanism
+(https://github.com/HealthX-Lab/BiomedCoOp, Koleilat et al., CVPR 2025) into
+MedTsLLM, replacing the earlier "inject descriptions as input text" approach
+(which does not reproduce the method and did not help).
 
-What BiomedCoOp's prompting strategy is
----------------------------------------
-BiomedCoOp builds, for every class, an *ensemble of LLM-generated descriptive
-sentences* (their ``BIOMEDCOOP_TEMPLATES`` dict in
-``trainers/prompt_templates.py``). Each sentence describes the characteristic
-appearance of that class. Instead of a single hand-written template
-("a photo of a {}."), the model is conditioned on many rich, class-specific
-descriptions.
+WHAT BIOMEDCOOP ACTUALLY DOES
+-----------------------------
+BiomedCoOp is a CLIP prompt-learning method. The LLM-generated per-class
+descriptions are NOT fed to the model as input. They are encoded by a *frozen*
+text encoder to produce per-class "teacher" text embeddings, which are then used
+in three ways:
 
-Adaptation to MedTsLLM
-----------------------
-MedTsLLM is a decoder-only LLM that consumes a *text* prompt followed by the
-reprogrammed time-series patch embeddings. We therefore inject the per-class
-descriptions directly into that text prompt (see ``MedTsLLM.build_class_prompt``
-in ``models/medtsllm.py``). At each step a few descriptions per class are
-sampled (the ensemble-sampling analogue of BiomedCoOp's prompt ensemble),
-giving the LLM explicit, expert-style knowledge of what each diagnostic
-category looks like before it sees the signal.
+  1. As the **classifier weights**. In CoOp/CLIP the class text embeddings ARE
+     the linear classifier: logits = scale * <sample_embedding, class_text_emb>.
+     The descriptions therefore *define the decision boundary*.
+  2. **KDSP** - Knowledge Distillation with Statistics-based Prompt Selection.
+     Outlier descriptions are removed with a robust (median/MAD) z-score filter,
+     the survivors are averaged into a per-class prototype, and the resulting
+     zero-shot logits are distilled into the trainable head via KL divergence.
+  3. **SCCM** - Semantic Consistency (an MSE pull of a *learnable* prompt's text
+     embedding toward the mean teacher embedding). SCCM only applies when there
+     is a learnable text prompt; it is optional here (off by default) because
+     the minimal port trains the time-series side, not a text prompt.
 
-``BIOMEDCOOP_TS_TEMPLATES`` below mirrors the structure of BiomedCoOp's
-``BIOMEDCOOP_TEMPLATES`` (``class -> list[str]``), populated with the
-characteristic 12-lead ECG features of the five PTB-XL diagnostic superclasses
-(NORM, MI, STTC, CD, HYP).
+WHY THE OLD PORT DIDN'T WORK
+----------------------------
+Concatenating descriptions into the decoder context produced a *constant*,
+class-agnostic prefix in front of a *frozen* LLM whose classification head reads
+only the time-series patch positions. A constant prefix carries no per-example,
+label-discriminative gradient, so the head still had to do all the work from the
+signal alone; random per-step sampling of descriptions merely added input noise.
 
-Public API
-----------
-``load_class_prompts(path, class_codes) -> list[list[str]]``
-    Returns one list of description strings per class, in the order of
-    ``class_codes``. ``path`` may point to a JSON file (``code -> list[str]``)
-    to override / extend the built-in templates; pass ``""`` / ``"none"`` /
-    ``"default"`` to use the built-ins.
+THIS MODULE
+-----------
+`load_class_prompts(path, class_codes)`         -> list[list[str]]   (unchanged)
+`statistics_based_prompt_selection(scores, tau)`-> boolean mask      (SPS)
+`BiomedCoOpHead`                                -> nn.Module         (prototype
+    classifier + KDSP/SCCM aux losses). The host model precomputes frozen
+    per-class prototype embeddings from the descriptions and pools the LLM's
+    time-series output into a sample embedding; the head does the rest.
 """
 
 import json
 import os
 
-__all__ = ["load_class_prompts", "BIOMEDCOOP_TS_TEMPLATES", "CODE_TO_NAME"]
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-# Canonical PTB-XL superclass code -> human-readable diagnostic name.
+__all__ = [
+    "load_class_prompts",
+    "statistics_based_prompt_selection",
+    "BiomedCoOpHead",
+    "BIOMEDCOOP_TS_TEMPLATES",
+    "CODE_TO_NAME",
+]
+
+
+# ----------------------------------------------------------------------------
+# Class descriptions (the BiomedCoOp prompt ensemble), adapted to the five
+# PTB-XL diagnostic superclasses. Mirrors BiomedCoOp's BIOMEDCOOP_TEMPLATES
+# (class -> list[str]).
+# ----------------------------------------------------------------------------
 CODE_TO_NAME = {
     "NORM": "Normal ECG",
     "MI": "Myocardial Infarction",
@@ -56,10 +73,6 @@ CODE_TO_NAME = {
     "HYP": "Hypertrophy",
 }
 
-
-# Per-class ensemble of descriptive prompts, mirroring BiomedCoOp's
-# BIOMEDCOOP_TEMPLATES (class -> list[str]). Descriptions state the
-# well-established characteristic 12-lead ECG features of each superclass.
 BIOMEDCOOP_TS_TEMPLATES = {
     "NORM": [
         "A normal ECG shows a regular sinus rhythm with a heart rate between 60 and 100 beats per minute.",
@@ -154,8 +167,10 @@ BIOMEDCOOP_TS_TEMPLATES = {
 }
 
 
+# ----------------------------------------------------------------------------
+# Prompt loading (unchanged API)
+# ----------------------------------------------------------------------------
 def _normalize_templates(raw):
-    """Coerce a loaded JSON object into ``{key: list[str]}`` with string values."""
     if not isinstance(raw, dict):
         raise ValueError(
             "BiomedCoOp class-prompt file must be a JSON object mapping "
@@ -172,46 +187,24 @@ def _normalize_templates(raw):
 
 
 def load_class_prompts(path, class_codes):
-    """Load per-class BiomedCoOp-style descriptive prompts.
+    """Return one list of description strings per class, ordered by class_codes.
 
-    Args:
-        path: Path to a JSON file mapping class code (or name) -> list of
-            description strings. Pass ``""``, ``"none"``, ``"default"``, or
-            ``"builtin"`` (or ``None``) to use the built-in
-            ``BIOMEDCOOP_TS_TEMPLATES``. A JSON file may define a subset of
-            classes; any class it does not define falls back to the built-ins.
-        class_codes: Ordered iterable of class codes (e.g. PTB-XL superclasses
-            ``["NORM", "MI", "STTC", "CD", "HYP"]``). The returned list follows
-            this exact order so it lines up with the model's class index order.
-
-    Returns:
-        ``list[list[str]]`` of length ``len(class_codes)``: each element is the
-        list of description strings for the corresponding class.
-
-    Raises:
-        FileNotFoundError: if ``path`` is given but does not exist.
-        KeyError: if a requested class has no descriptions in either the file
-            or the built-in templates.
+    `path` may point to a JSON file (code/name -> list[str]) to override or
+    extend the built-ins; pass "" / "none" / "default" to use the built-ins.
     """
-    # Start from the built-in templates, then let a JSON file override/extend.
     templates = dict(BIOMEDCOOP_TS_TEMPLATES)
-
     use_builtin = path is None or str(path).strip().lower() in (
         "", "none", "default", "builtin", "built-in",
     )
     if not use_builtin:
         if not os.path.exists(path):
             raise FileNotFoundError(
-                f"BiomedCoOp class-prompt file not found: {path!r}. "
-                f"Set prompting.class_prompts_path to a valid JSON file, or to "
-                f'"" to use the built-in ECG templates.'
+                f"BiomedCoOp class-prompt file not found: {path!r}. Set "
+                f'class_prompts_path to a valid JSON file, or to "" for built-ins.'
             )
         with open(path, "r", encoding="utf-8") as f:
-            file_templates = _normalize_templates(json.load(f))
-        templates.update(file_templates)
+            templates.update(_normalize_templates(json.load(f)))
 
-    # Case-insensitive lookup that accepts either codes ("MI") or names
-    # ("Myocardial Infarction").
     lookup = {str(k).strip().lower(): v for k, v in templates.items()}
     for code, name in CODE_TO_NAME.items():
         if code in templates and name.strip().lower() not in lookup:
@@ -227,10 +220,121 @@ def load_class_prompts(path, class_codes):
             else:
                 raise KeyError(
                     f"No BiomedCoOp class prompts found for class {code!r}. "
-                    f"Available keys: {sorted(templates.keys())}. Add an entry "
-                    f"for this class to your class_prompts JSON file or to "
-                    f"BIOMEDCOOP_TS_TEMPLATES."
+                    f"Available keys: {sorted(templates.keys())}."
                 )
         descriptions.append(list(lookup[key]))
-
     return descriptions
+
+
+# ----------------------------------------------------------------------------
+# Statistics-based Prompt Selection (SPS) -- faithful to BiomedCoOp
+# ----------------------------------------------------------------------------
+def statistics_based_prompt_selection(scores, tau):
+    """Return a boolean mask over prompts, keeping non-outliers.
+
+    Mirrors BiomedCoOp: a robust modified z-score using the median and the
+    median absolute deviation (MAD), then a second standardisation, thresholded
+    at `tau`. Falls back to keeping all prompts if MAD/std collapse.
+    """
+    scores = scores.detach().float()
+    s_bar = torch.median(scores)
+    d_bar = torch.median(torch.abs(scores - s_bar))
+    if d_bar <= 0:
+        return torch.ones_like(scores, dtype=torch.bool)
+    z = (scores - s_bar) / d_bar
+    z_std = torch.std(z)
+    if z_std <= 0:
+        return torch.ones_like(scores, dtype=torch.bool)
+    mask = torch.abs((z - torch.mean(z)) / z_std) <= tau
+    if mask.sum() == 0:                      # safety: never drop everything
+        mask = torch.ones_like(scores, dtype=torch.bool)
+    return mask
+
+
+# ----------------------------------------------------------------------------
+# BiomedCoOp prototype classification head
+# ----------------------------------------------------------------------------
+class BiomedCoOpHead(nn.Module):
+    """Prototype (CLIP-style) classifier with KDSP / SCCM regularisation.
+
+    The host model supplies:
+      * `class_prototypes`: frozen per-class, per-prompt text embeddings of the
+        descriptions, shape [n_cls, n_prompts, d_llm] (encoded once by the
+        frozen LLM and pooled over tokens).
+      * `ts_emb`: the pooled LLM output over the time-series patches, shape
+        [bs, d_llm]  (the "sample" embedding, analogous to CLIP image features).
+
+    Forward returns class logits. During training it also stores the auxiliary
+    KDSP (+ optional SCCM) loss; the host model exposes it as `self.aux_loss`,
+    which `tasks/classification.py` already adds to the cross-entropy loss.
+    """
+
+    def __init__(self, d_llm, n_cls, tau=2.0, kdsp_lambda=1.0, sccm_lambda=0.0,
+                 logit_scale_init=4.6052, learnable_scale=True):
+        super().__init__()
+        self.n_cls = n_cls
+        self.tau = tau
+        self.kdsp_lambda = kdsp_lambda
+        self.sccm_lambda = sccm_lambda
+
+        # Projection of the time-series sample embedding into the (frozen) text
+        # prototype space. Initialised near identity so training starts close to
+        # a plain zero-shot prototype classifier.
+        self.ts_proj = nn.Linear(d_llm, d_llm, bias=False)
+        nn.init.eye_(self.ts_proj.weight)
+
+        # Temperature, like CLIP's logit_scale (stored in log space).
+        scale = torch.tensor(float(logit_scale_init))
+        if learnable_scale:
+            self.logit_scale = nn.Parameter(scale)
+        else:
+            self.register_buffer("logit_scale", scale)
+
+        self.aux_loss = None  # set during training
+
+    def forward(self, ts_emb, class_prototypes, labels=None):
+        # ts_emb: [bs, d_llm] ; class_prototypes: [n_cls, n_prompts, d_llm]
+        proto = class_prototypes.to(ts_emb.dtype)
+        proto = proto / proto.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        proto_mean = proto.mean(dim=1)                                   # [n_cls, d_llm]
+        proto_mean = proto_mean / proto_mean.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        scale = self.logit_scale.exp().clamp(max=100.0)
+
+        # --- student head: learned projection vs mean prototypes ---
+        feat = self.ts_proj(ts_emb)
+        feat = feat / feat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        logits = scale * feat @ proto_mean.t()                          # [bs, n_cls]
+
+        if labels is None or not self.training:
+            self.aux_loss = None
+            return logits
+
+        # --- KDSP: distil SPS-selected zero-shot prototypes into the head ---
+        with torch.no_grad():
+            zs = ts_emb / ts_emb.norm(dim=-1, keepdim=True).clamp_min(1e-8)  # zero-shot feature (no learned proj)
+            # per-prompt alignment score s_p = mean_b max_c <zs, proto[:,p,:]>
+            scores = []
+            for p in range(proto.shape[1]):
+                tl = scale * zs @ proto[:, p, :].t()                    # [bs, n_cls]
+                scores.append(tl.max(dim=1).values.mean())
+            scores = torch.stack(scores)                                # [n_prompts]
+            mask = statistics_based_prompt_selection(scores, self.tau)
+            selected = proto[:, mask, :].mean(dim=1)                    # [n_cls, d_llm]
+            selected = selected / selected.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            zero_shot_logits = scale * zs @ selected.t()                # [bs, n_cls]
+
+        loss_kdsp = F.kl_div(
+            F.log_softmax(logits, dim=1),
+            F.log_softmax(zero_shot_logits, dim=1),
+            reduction="sum", log_target=True,
+        ) / logits.numel()
+
+        aux = self.kdsp_lambda * loss_kdsp
+
+        # --- optional SCCM: pull mean prototypes & student head together ---
+        if self.sccm_lambda > 0:
+            aux = aux + self.sccm_lambda * F.mse_loss(feat.mean(0), proto_mean.mean(0))
+
+        self.aux_loss = aux
+        return logits
