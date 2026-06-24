@@ -14,6 +14,7 @@ from peft import get_peft_model
 
 from .layers.embed import PatchEmbedding
 from .layers.RevIN import RevIN
+from .biomedcoop_ts import BiomedCoOpHead, CODE_TO_NAME
 
 from utils import dict_to_object
 
@@ -57,19 +58,44 @@ class MedTsLLM(nn.Module):
 
         self.n_classes = dataset.n_classes if self.task in ["classification", "semantic_segmentation"] else 0
 
-        # --- BiomedCoOp-style class-description prompting (optional) ---
+        # --- BiomedCoOp-style class-description prompting (optional, WEAK) ---
+        # Legacy path: inject class descriptions as input text. Kept for ablation
+        # but does NOT reproduce BiomedCoOp and is off by default (see the
+        # `biomedcoop` head below, which is the faithful mechanism).
         self.class_descriptions = None
         _pcfg = self.model_config.get("prompting")
         if _pcfg is not None and _pcfg.get("class_prompts", False) and self.task == "classification":
             from .biomedcoop_ts import load_class_prompts
-            _name_map = {"NORM": "Normal ECG", "MI": "Myocardial Infarction",
-                         "STTC": "ST/T Change", "CD": "Conduction Disturbance",
-                         "HYP": "Hypertrophy"}
-            self.class_codes = _pcfg.get("class_codes", list(_name_map.keys()))
-            self.class_names = _pcfg.get("class_names", None) or [_name_map.get(c, c) for c in self.class_codes]
+            self.class_codes = _pcfg.get("class_codes", list(CODE_TO_NAME.keys()))
+            self.class_names = _pcfg.get("class_names", None) or [CODE_TO_NAME.get(c, c) for c in self.class_codes]
             self.class_descriptions = load_class_prompts(_pcfg.class_prompts_path, self.class_codes)
             self.class_prompts_k = _pcfg.get("class_prompts_per_class", 3)
             self.class_prompts_sample = _pcfg.get("class_prompts_sample", True)
+
+        # --- BiomedCoOp prototype head (faithful mechanism) ---
+        # Descriptions become the *classifier* (CLIP/CoOp style) instead of input
+        # text, with SPS + KDSP distillation. This is what actually reproduces
+        # the method. Prototypes are built lazily on the first forward.
+        self.use_biomedcoop = False
+        self.aux_loss = None
+        self._bc_prototypes = None
+        _bcfg = self.model_config.get("biomedcoop")
+        if _bcfg is not None and _bcfg.get("enabled", False) and self.task == "classification":
+            from .biomedcoop_ts import load_class_prompts
+            self.use_biomedcoop = True
+            self.bc_class_codes = _bcfg.get("class_codes", list(CODE_TO_NAME.keys()))
+            self.bc_descriptions = load_class_prompts(_bcfg.get("class_prompts_path", ""), self.bc_class_codes)
+            self.bc_n_prompts = min(
+                _bcfg.get("n_prompts", 16), min(len(d) for d in self.bc_descriptions)
+            )
+            self.bc_pool = _bcfg.get("pool", "mean")          # "mean" | "last"
+            self.bc_tau = _bcfg.get("tau", 2.0)
+            self.bc_kdsp_lambda = _bcfg.get("kdsp_lambda", 1.0)
+            self.bc_sccm_lambda = _bcfg.get("sccm_lambda", 0.0)
+            assert self.n_classes == len(self.bc_descriptions), (
+                f"biomedcoop expects {self.n_classes} classes, got "
+                f"{len(self.bc_descriptions)} description groups."
+            )
 
         if self.task in ["forecasting", "reconstruction", "anomaly_detection", "pretraining"]:
             self.n_outputs_per_step = self.n_features
@@ -115,6 +141,15 @@ class MedTsLLM(nn.Module):
         self.patch_embedding = PatchEmbedding(self.d_patch, self.patch_len, self.stride, self.dropout, pos_embed=False)
         self.reprogramming_layer = ReprogrammingLayer(self.d_model, self.n_attention_heads, self.d_ff, self.d_llm, attention_dropout=self.dropout)
         self.output_projection = FlattenHead(self.d_ff * self.n_patches, self.n_outputs, head_dropout=0)
+
+        if self.use_biomedcoop:
+            self.bc_head = BiomedCoOpHead(
+                d_llm=self.d_llm,
+                n_cls=self.n_classes,
+                tau=self.bc_tau,
+                kdsp_lambda=self.bc_kdsp_lambda,
+                sccm_lambda=self.bc_sccm_lambda,
+            )
 
         self.embedding_downsample_mode = self.model_config.embedding_downsample_mode
         if self.embedding_downsample_mode == "linear":
@@ -378,6 +413,13 @@ class MedTsLLM(nn.Module):
         dec_out = dec_out.to(x_enc.dtype)
 
         dec_out = dec_out[:, -self.n_patches:, :]
+
+        if self.task == "classification" and self.use_biomedcoop:
+            # Prototype (CLIP/CoOp-style) classification: the descriptions are
+            # the classifier. Pool the d_llm patch tokens and score against the
+            # frozen per-class text prototypes (see BiomedCoOpHead).
+            return self._biomedcoop_classify(dec_out, bs, n_features, inputs.get("labels"))
+
         match self.embedding_downsample_mode:
             case "truncate":
                 dec_out = dec_out[:, :, :self.d_ff]
@@ -423,6 +465,57 @@ class MedTsLLM(nn.Module):
             dec_out = dec_out.squeeze(-1)
 
         return dec_out
+
+    def _encode_text_pooled(self, texts):
+        """Encode a list of strings with the frozen LLM and pool over tokens.
+
+        Returns [len(texts), d_llm]. Mirrors a CLIP text encoder: run the text
+        through the (frozen) backbone, then pool (masked-mean or last token).
+        """
+        tok = self.tokenizer(
+            texts, return_tensors="pt", padding=True, truncation=True, max_length=64,
+        )
+        input_ids = tok.input_ids.to(self.device)
+        attn = tok.attention_mask.to(self.device)
+        embeds = self.llm.get_input_embeddings()(input_ids)
+        out = self.llm(inputs_embeds=embeds, attention_mask=attn).last_hidden_state
+        out = out.to(embeds.dtype)
+        if self.bc_pool == "last":
+            idx = attn.sum(dim=1) - 1
+            pooled = out[torch.arange(out.size(0), device=out.device), idx]
+        else:  # masked mean
+            m = attn.unsqueeze(-1).to(out.dtype)
+            pooled = (out * m).sum(dim=1) / m.sum(dim=1).clamp_min(1e-6)
+        return pooled
+
+    @torch.no_grad()
+    def _build_class_prototypes(self):
+        """Precompute frozen per-class, per-prompt text prototypes (once).
+
+        Shape: [n_cls, n_prompts, d_llm]. This is BiomedCoOp's `fixed_embeddings`
+        (the frozen teacher text features of the description ensemble).
+        """
+        was_training = self.llm.training
+        self.llm.eval()
+        protos = []
+        for descs in self.bc_descriptions:
+            pooled = self._encode_text_pooled(descs[: self.bc_n_prompts])  # [n_prompts, d_llm]
+            protos.append(pooled)
+        self._bc_prototypes = torch.stack(protos, dim=0)                   # [n_cls, n_prompts, d_llm]
+        if was_training:
+            self.llm.train()
+
+    def _biomedcoop_classify(self, ts_tokens, bs, n_features, labels=None):
+        """Pool the time-series LLM output and classify against text prototypes."""
+        pooled = ts_tokens.mean(dim=1)                                     # [B0, d_llm]
+        if pooled.size(0) != bs:           # independent / merge-end expand by n_features
+            pooled = pooled.view(bs, n_features, -1).mean(dim=1)
+        if self._bc_prototypes is None:
+            self._build_class_prototypes()
+        protos = self._bc_prototypes.to(pooled.device)
+        logits = self.bc_head(pooled, protos, labels=labels if self.training else None)
+        self.aux_loss = self.bc_head.aux_loss
+        return logits
 
     def build_class_prompt(self):
         import random
