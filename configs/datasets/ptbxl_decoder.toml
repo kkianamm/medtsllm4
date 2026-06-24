@@ -54,17 +54,25 @@ clip = true          # patient-specific info (age/sex as JSON) -- the paper's bi
 input_stats = false
 examples = false     # required: build_prompt() reads cfg.examples directly
 
-# --- BiomedCoOp-style class prompting (decoder-only classification) ---
-# Injects an ensemble of LLM-generated, per-class descriptive prompts into the
-# decoder context (ported prompting strategy from HealthX-Lab/BiomedCoOp).
-class_prompts = true
-# "" / "none" / "default" -> use built-in ECG templates in models/biomedcoop_ts.py.
-# Or point to a JSON file (code -> list[str]), e.g.:
-#   class_prompts_path = "models/biomedcoop_prompts/ptbxl_ecg.json"
+# --- Legacy: inject class descriptions as input text (does NOT reproduce
+# BiomedCoOp; kept only for ablation). Off by default. ---
+class_prompts = false
 class_prompts_path = ""
-class_prompts_per_class = 3      # how many descriptions per class to inject
-class_prompts_sample = true      # randomly sample K each step in training; first-K at eval
-class_codes = ["NORM", "MI", "STTC", "CD", "HYP"]   # PTB-XL superclass order
+class_prompts_per_class = 3
+class_prompts_sample = true
+class_codes = ["NORM", "MI", "STTC", "CD", "HYP"]
+
+# --- BiomedCoOp prototype head (faithful mechanism) ---
+# The class descriptions become the classifier (CLIP/CoOp style), with
+# statistics-based prompt selection (SPS) + KDSP distillation.
+[models.medtsllm.biomedcoop]
+enabled = true
+class_prompts_path = ""        # "" -> built-in ECG templates; or a JSON file
+n_prompts = 16                 # descriptions per class used to build prototypes
+pool = "mean"                  # token pooling for text/TS embeddings: "mean" | "last"
+tau = 2.0                      # SPS outlier threshold (robust z-score)
+kdsp_lambda = 1.0              # weight of the KDSP distillation loss
+sccm_lambda = 0.0              # SCCM (needs learnable text prompt); 0 = off
 
 [models.medtsllm.llm]
 enabled = true
